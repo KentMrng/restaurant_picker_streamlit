@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import random
-from pathlib import Path
+from io import StringIO
+from typing import Iterable
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "周辺ランチ・飲食店ランダムピッカー"
-CSV_PATH = Path("restaurants.csv")
+APP_TITLE = "天王洲ランチ ランダムピッカー"
+DEFAULT_CACHE_TTL_SECONDS = 300
 REQUIRED_COLUMNS = {"name", "category"}
-OPTIONAL_COLUMNS = {
+OPTIONAL_COLUMNS = [
     "area",
     "map_url",
     "address",
@@ -19,213 +21,400 @@ OPTIONAL_COLUMNS = {
     "tags",
     "note",
     "active",
-}
+    "source_url",
+    "last_checked",
+]
+TRUE_VALUES = {"1", "true", "t", "yes", "y", "on", "active", "公開", "有効", "はい", "○", "〇"}
+FALSE_VALUES = {"0", "false", "f", "no", "n", "off", "inactive", "非公開", "無効", "いいえ", "×"}
 
 
-@st.cache_data(show_spinner=False)
-def load_restaurants(csv_path: str) -> pd.DataFrame:
-    """Load restaurant candidates from a CSV file."""
-    path = Path(csv_path)
-    if not path.exists():
-        raise FileNotFoundError(f"CSV file was not found: {path}")
+st.set_page_config(page_title=APP_TITLE, page_icon="🍽️", layout="wide")
 
-    df = pd.read_csv(path).fillna("")
-    df.columns = [str(column).strip() for column in df.columns]
 
-    missing = REQUIRED_COLUMNS - set(df.columns)
+class DataLoadError(RuntimeError):
+    """Raised when the restaurant source cannot be loaded."""
+
+
+def normalize_column_name(value: object) -> str:
+    """Normalize a CSV/Sheet header name for internal processing."""
+    return str(value).strip().lower().replace(" ", "_")
+
+
+def normalize_bool(value: object, default: bool = True) -> bool:
+    """Convert common spreadsheet values into booleans."""
+    if pd.isna(value):
+        return default
+    text = str(value).strip().lower()
+    if text in TRUE_VALUES:
+        return True
+    if text in FALSE_VALUES:
+        return False
+    return default
+
+
+def split_values(value: object) -> list[str]:
+    """Split comma-like spreadsheet cells into clean string values."""
+    if pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+
+    normalized = text.replace("、", ",").replace("，", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
+def get_secret_or_empty(key: str) -> str:
+    """Read a Streamlit secret without raising when secrets are unavailable."""
+    try:
+        value = st.secrets.get(key, "")
+    except Exception:
+        return ""
+    return str(value).strip()
+
+
+def google_sheet_url_to_csv_url(url: str) -> str:
+    """Convert common Google Sheets URLs into a CSV export URL.
+
+    Supported inputs:
+    - https://docs.google.com/spreadsheets/d/<sheet_id>/edit#gid=0
+    - https://docs.google.com/spreadsheets/d/<sheet_id>/edit?gid=0#gid=0
+    - https://docs.google.com/spreadsheets/d/e/<published_id>/pub?output=csv
+    - Any direct CSV URL
+    """
+    clean_url = url.strip()
+    if not clean_url:
+        raise DataLoadError("Google Sheets URL is empty.")
+
+    lowered = clean_url.lower()
+    if "output=csv" in lowered or "format=csv" in lowered:
+        return clean_url
+
+    parsed = urlparse(clean_url)
+    if "docs.google.com" not in parsed.netloc or "/spreadsheets/" not in parsed.path:
+        return clean_url
+
+    # Published-to-web URL, e.g. /spreadsheets/d/e/<id>/pubhtml -> /pub?output=csv
+    if "/spreadsheets/d/e/" in parsed.path:
+        base = clean_url.split("/pub", maxsplit=1)[0]
+        return f"{base}/pub?output=csv"
+
+    parts = parsed.path.split("/")
+    try:
+        sheet_id = parts[parts.index("d") + 1]
+    except (ValueError, IndexError) as exc:
+        raise DataLoadError("Could not parse the Google Sheet ID from the URL.") from exc
+
+    query_params = parse_qs(parsed.query)
+    fragment_params = parse_qs(parsed.fragment)
+    gid = "0"
+    if "gid" in query_params and query_params["gid"]:
+        gid = query_params["gid"][0]
+    elif "gid" in fragment_params and fragment_params["gid"]:
+        gid = fragment_params["gid"][0]
+
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+
+@st.cache_data(ttl=DEFAULT_CACHE_TTL_SECONDS, show_spinner=False)
+def load_restaurants_from_url(source_url: str) -> pd.DataFrame:
+    """Load restaurant data from a Google Sheets CSV export URL."""
+    csv_url = google_sheet_url_to_csv_url(source_url)
+    try:
+        df = pd.read_csv(csv_url)
+    except Exception as exc:
+        raise DataLoadError(
+            "Could not load the Google Sheet. Make sure it is shared as viewable by link "
+            "or published to the web as CSV."
+        ) from exc
+    return normalize_restaurant_frame(df)
+
+
+@st.cache_data(ttl=DEFAULT_CACHE_TTL_SECONDS, show_spinner=False)
+def load_restaurants_from_uploaded_csv(csv_text: str) -> pd.DataFrame:
+    """Load restaurant data from an uploaded CSV file."""
+    try:
+        df = pd.read_csv(StringIO(csv_text))
+    except Exception as exc:
+        raise DataLoadError("Could not read the uploaded CSV file.") from exc
+    return normalize_restaurant_frame(df)
+
+
+def normalize_restaurant_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize and validate restaurant records from a spreadsheet-like table."""
+    normalized = df.copy()
+    normalized.columns = [normalize_column_name(column) for column in normalized.columns]
+
+    missing = sorted(REQUIRED_COLUMNS - set(normalized.columns))
     if missing:
-        missing_columns = ", ".join(sorted(missing))
-        raise ValueError(f"restaurants.csv is missing required columns: {missing_columns}")
+        joined = ", ".join(missing)
+        raise DataLoadError(f"Required columns are missing: {joined}")
 
-    df["name"] = df["name"].astype(str).str.strip()
-    df["category"] = df["category"].astype(str).str.strip()
-    df = df[df["name"] != ""]
-    df = df[df["category"] != ""]
+    for column in OPTIONAL_COLUMNS:
+        if column not in normalized.columns:
+            normalized[column] = ""
 
-    if "active" in df.columns:
-        active_values = df["active"].astype(str).str.strip().str.lower()
-        inactive_values = {"0", "false", "no", "n", "off", "inactive", "非表示", "無効"}
-        df = df[~active_values.isin(inactive_values)]
+    normalized["name"] = normalized["name"].astype(str).str.strip()
+    normalized["category"] = normalized["category"].astype(str).str.strip()
+    normalized = normalized[(normalized["name"] != "") & (normalized["category"] != "")]
 
-    return df.reset_index(drop=True)
+    if "active" in normalized.columns:
+        normalized = normalized[normalized["active"].map(lambda value: normalize_bool(value, default=True))]
 
+    if normalized.empty:
+        raise DataLoadError("No active restaurant records were found.")
 
-def build_google_maps_search_url(name: str, area: str = "") -> str:
-    """Build a fallback Google Maps search URL when map_url is not provided."""
-    query = f"{name} {area}".strip().replace(" ", "+")
-    return f"https://www.google.com/maps/search/?api=1&query={query}"
+    return normalized.reset_index(drop=True)
 
 
 def get_categories(df: pd.DataFrame) -> list[str]:
-    """Return sorted category names from the CSV data."""
-    return sorted(category for category in df["category"].dropna().unique() if str(category).strip())
+    """Return sorted unique categories."""
+    values: set[str] = set()
+    for value in df["category"].dropna():
+        for item in split_values(value):
+            values.add(item)
+    return sorted(values)
+
+
+def get_tags(df: pd.DataFrame) -> list[str]:
+    """Return sorted unique tags."""
+    values: set[str] = set()
+    if "tags" not in df.columns:
+        return []
+    for value in df["tags"].dropna():
+        for item in split_values(value):
+            values.add(item)
+    return sorted(values)
+
+
+def row_has_any_value(cell_value: object, selected_values: Iterable[str]) -> bool:
+    """Return True when a comma-like cell contains any selected value."""
+    selected = set(selected_values)
+    if not selected:
+        return False
+    return bool(set(split_values(cell_value)) & selected)
+
+
+def make_maps_search_url(row: pd.Series) -> str:
+    """Return the stored map URL or a Google Maps search URL."""
+    map_url = str(row.get("map_url", "")).strip()
+    if map_url and map_url.lower() != "nan":
+        return map_url
+
+    query_parts = [str(row.get("name", "")).strip(), str(row.get("area", "")).strip()]
+    query = " ".join(part for part in query_parts if part and part.lower() != "nan")
+    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(query)}"
 
 
 def filter_restaurants(
     df: pd.DataFrame,
     selected_categories: list[str],
+    selected_tags: list[str],
     keyword: str,
-    include_tags: list[str],
 ) -> pd.DataFrame:
-    """Filter restaurants by selected categories, keyword, and tags."""
-    filtered = df[df["category"].isin(selected_categories)].copy()
+    """Filter restaurants by category, tags, and keyword."""
+    filtered = df.copy()
 
-    if keyword:
-        keyword_lower = keyword.lower().strip()
-        searchable_columns = [
-            column
-            for column in ["name", "category", "area", "address", "price_range", "open_hours", "tags", "note"]
-            if column in filtered.columns
+    if selected_categories:
+        filtered = filtered[
+            filtered["category"].map(lambda value: row_has_any_value(value, selected_categories))
         ]
-        mask = pd.Series(False, index=filtered.index)
-        for column in searchable_columns:
-            mask = mask | filtered[column].astype(str).str.lower().str.contains(keyword_lower, na=False)
-        filtered = filtered[mask]
+    else:
+        filtered = filtered.iloc[0:0]
 
-    if include_tags and "tags" in filtered.columns:
-        tag_mask = pd.Series(False, index=filtered.index)
-        for tag in include_tags:
-            tag_mask = tag_mask | filtered["tags"].astype(str).str.contains(tag, case=False, na=False)
-        filtered = filtered[tag_mask]
+    if selected_tags:
+        filtered = filtered[filtered["tags"].map(lambda value: row_has_any_value(value, selected_tags))]
+
+    stripped_keyword = keyword.strip().lower()
+    if stripped_keyword:
+        search_columns = [
+            "name",
+            "category",
+            "area",
+            "address",
+            "price_range",
+            "open_hours",
+            "tags",
+            "note",
+        ]
+        existing_columns = [column for column in search_columns if column in filtered.columns]
+        haystack = filtered[existing_columns].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+        filtered = filtered[haystack.str.contains(stripped_keyword, regex=False)]
 
     return filtered.reset_index(drop=True)
 
 
-def pick_random_restaurant(df: pd.DataFrame, avoid_previous: bool) -> dict[str, str] | None:
-    """Pick one restaurant from the filtered candidates."""
-    if df.empty:
-        return None
+def render_category_checkboxes(categories: list[str]) -> list[str]:
+    """Render category checkboxes and return selected categories."""
+    st.sidebar.subheader("カテゴリ")
 
-    records = df.to_dict(orient="records")
-    previous_name = st.session_state.get("picked_restaurant", {}).get("name")
+    if "selected_categories" not in st.session_state:
+        st.session_state.selected_categories = categories.copy()
 
-    if avoid_previous and previous_name and len(records) > 1:
-        records = [record for record in records if record.get("name") != previous_name]
+    col_a, col_b = st.sidebar.columns(2)
+    if col_a.button("すべてON", use_container_width=True):
+        st.session_state.selected_categories = categories.copy()
+    if col_b.button("すべてOFF", use_container_width=True):
+        st.session_state.selected_categories = []
 
-    return random.choice(records)
+    selected: list[str] = []
+    columns = st.sidebar.columns(2)
+    for index, category in enumerate(categories):
+        key = f"category::{category}"
+        default_value = category in st.session_state.selected_categories
+        is_checked = columns[index % 2].checkbox(category, value=default_value, key=key)
+        if is_checked:
+            selected.append(category)
+
+    st.session_state.selected_categories = selected
+    return selected
 
 
-def render_restaurant_card(restaurant: dict[str, str]) -> None:
-    """Render the selected restaurant."""
-    name = str(restaurant.get("name", "")).strip()
-    category = str(restaurant.get("category", "")).strip()
-    area = str(restaurant.get("area", "")).strip()
-    map_url = str(restaurant.get("map_url", "")).strip()
+def render_restaurant_card(row: pd.Series, title: str = "今日の候補") -> None:
+    """Render a selected restaurant."""
+    map_url = make_maps_search_url(row)
 
-    if not map_url:
-        map_url = build_google_maps_search_url(name, area)
+    st.markdown(f"### {title}: {row.get('name', '')}")
+    st.markdown(f"[Google Mapsで開く]({map_url})")
 
-    st.subheader(name)
-    st.caption(" / ".join(value for value in [category, area] if value))
-
-    detail_rows = []
+    meta_items = []
     for label, column in [
-        ("住所", "address"),
+        ("カテゴリ", "category"),
+        ("エリア", "area"),
         ("価格帯", "price_range"),
         ("営業時間", "open_hours"),
-        ("タグ", "tags"),
-        ("メモ", "note"),
     ]:
-        value = str(restaurant.get(column, "")).strip()
-        if value:
-            detail_rows.append((label, value))
+        value = str(row.get(column, "")).strip()
+        if value and value.lower() != "nan":
+            meta_items.append(f"**{label}:** {value}")
 
-    if detail_rows:
-        for label, value in detail_rows:
-            st.markdown(f"**{label}:** {value}")
+    if meta_items:
+        st.markdown("  ".join(meta_items))
 
-    st.link_button("Google Mapsで開く", map_url)
+    address = str(row.get("address", "")).strip()
+    if address and address.lower() != "nan":
+        st.caption(address)
+
+    tags = str(row.get("tags", "")).strip()
+    if tags and tags.lower() != "nan":
+        st.write(f"🏷️ {tags}")
+
+    note = str(row.get("note", "")).strip()
+    if note and note.lower() != "nan":
+        st.info(note)
 
 
-def render_candidates_table(df: pd.DataFrame) -> None:
-    """Render the filtered candidates as a compact table."""
-    display_columns = [
-        column
-        for column in ["name", "category", "area", "price_range", "tags", "note"]
-        if column in df.columns
-    ]
-    if display_columns:
-        st.dataframe(
-            df[display_columns],
-            use_container_width=True,
-            hide_index=True,
-        )
+def render_setup_help() -> None:
+    """Render setup instructions when no Google Sheets URL is configured."""
+    st.warning("Google Sheets URLが未設定です。")
+    st.markdown(
+        """
+        `streamlit_app.py` と同じリポジトリをStreamlit Cloudへデプロイし、Secretsに以下を設定してください。
+
+        ```toml
+        GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/xxxxxxxx/edit#gid=0"
+        ```
+
+        Google Sheets側には、最低限この2列が必要です。
+
+        ```csv
+        name,category
+        ```
+
+        推奨列は以下です。
+
+        ```csv
+        name,category,area,map_url,address,price_range,open_hours,tags,note,active
+        ```
+        """
+    )
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🍽️", layout="wide")
-    st.title("🍽️ 周辺ランチ・飲食店ランダムピッカー")
-    st.caption("restaurants.csv のリストから、カテゴリ条件に合うお店をランダムに選びます。")
+    """Run the Streamlit application."""
+    st.title(APP_TITLE)
+    st.caption("Google Sheetsの店舗リストから、カテゴリ条件に合うランチ候補をランダムに選びます。")
+
+    configured_url = get_secret_or_empty("GOOGLE_SHEET_URL") or get_secret_or_empty("GOOGLE_SHEET_CSV_URL")
+
+    with st.sidebar:
+        st.header("データソース")
+        manual_url = st.text_input(
+            "Google Sheets URL",
+            value=configured_url,
+            placeholder="https://docs.google.com/spreadsheets/d/1ZrXZcY-Fr4My0aoj8VCT6VxG_SN6czrvLa7xT8pw1U4/edit?gid=0#gid=0",
+            help="Streamlit CloudではSecretsのGOOGLE_SHEET_URLに設定するのがおすすめです。",
+        )
+        uploaded_file = st.file_uploader("一時確認用CSV", type=["csv"])
+        if st.button("データを再読み込み", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
 
     try:
-        df = load_restaurants(str(CSV_PATH))
-    except Exception as exc:
+        if uploaded_file is not None:
+            csv_text = uploaded_file.getvalue().decode("utf-8-sig")
+            df = load_restaurants_from_uploaded_csv(csv_text)
+            source_label = "アップロードCSV"
+        elif manual_url.strip():
+            df = load_restaurants_from_url(manual_url.strip())
+            source_label = "Google Sheets"
+        else:
+            render_setup_help()
+            return
+    except DataLoadError as exc:
         st.error(str(exc))
         st.stop()
 
     categories = get_categories(df)
-    if not categories:
-        st.error("restaurants.csv に有効な category がありません。")
-        st.stop()
+    selected_categories = render_category_checkboxes(categories)
 
-    all_tags: list[str] = []
-    if "tags" in df.columns:
-        tag_values = df["tags"].astype(str).str.split(",")
-        all_tags = sorted(
-            {
-                tag.strip()
-                for tags in tag_values
-                for tag in tags
-                if tag.strip()
-            }
-        )
+    st.sidebar.subheader("追加フィルター")
+    tags = get_tags(df)
+    selected_tags = st.sidebar.multiselect("タグ", options=tags)
+    keyword = st.sidebar.text_input("キーワード", placeholder="例: カレー / テラス / 一人OK")
+    avoid_previous = st.sidebar.checkbox("前回と同じ店を避ける", value=True)
 
-    with st.sidebar:
-        st.header("条件")
-        st.write("カテゴリ")
+    filtered = filter_restaurants(df, selected_categories, selected_tags, keyword)
 
-        selected_categories = []
-        for category in categories:
-            checked = st.checkbox(category, value=True, key=f"category_{category}")
-            if checked:
-                selected_categories.append(category)
-
-        st.divider()
-        keyword = st.text_input("キーワード", placeholder="例: 駅近、安い、カレー")
-        include_tags = st.multiselect("タグで絞り込み", all_tags) if all_tags else []
-        avoid_previous = st.checkbox("前回と同じ店を避ける", value=True)
-        show_candidates = st.checkbox("候補リストを表示", value=True)
-
-    filtered = filter_restaurants(df, selected_categories, keyword, include_tags)
-
-    left, right = st.columns([1, 1])
-    with left:
-        st.metric("候補数", len(filtered))
-    with right:
-        st.metric("登録店舗数", len(df))
+    metric_col_1, metric_col_2, metric_col_3 = st.columns(3)
+    metric_col_1.metric("データソース", source_label)
+    metric_col_2.metric("登録店舗", len(df))
+    metric_col_3.metric("現在の候補", len(filtered))
 
     if filtered.empty:
-        st.warning("条件に合うお店がありません。カテゴリやキーワードを調整してください。")
-        if show_candidates:
-            st.subheader("全登録リスト")
-            render_candidates_table(df)
+        st.error("条件に合う店舗がありません。カテゴリやフィルターを緩めてください。")
         st.stop()
 
-    if "picked_restaurant" not in st.session_state:
-        st.session_state["picked_restaurant"] = pick_random_restaurant(filtered, avoid_previous=False)
+    if "last_selected_name" not in st.session_state:
+        st.session_state.last_selected_name = ""
 
-    if st.button("ランダムで選ぶ", type="primary", use_container_width=True):
-        st.session_state["picked_restaurant"] = pick_random_restaurant(filtered, avoid_previous)
+    button_col_1, button_col_2 = st.columns([2, 1])
+    pick_clicked = button_col_1.button("ランダムで選ぶ", type="primary", use_container_width=True)
+    show_candidates = button_col_2.toggle("候補一覧を表示", value=False)
 
-    picked_restaurant = st.session_state.get("picked_restaurant")
-    if picked_restaurant:
-        st.success("今日の候補")
-        render_restaurant_card(picked_restaurant)
+    if pick_clicked:
+        choices = filtered
+        if avoid_previous and len(filtered) > 1 and st.session_state.last_selected_name:
+            choices = filtered[filtered["name"] != st.session_state.last_selected_name]
+            if choices.empty:
+                choices = filtered
+
+        selected_row = choices.sample(n=1, random_state=random.randint(0, 10_000_000)).iloc[0]
+        st.session_state.last_selected_name = str(selected_row["name"])
+        st.session_state.selected_row = selected_row.to_dict()
+
+    if "selected_row" in st.session_state:
+        render_restaurant_card(pd.Series(st.session_state.selected_row))
+    else:
+        st.info("条件を確認してから「ランダムで選ぶ」を押してください。")
 
     if show_candidates:
-        st.divider()
-        st.subheader("現在の候補リスト")
-        render_candidates_table(filtered)
+        display_columns = [
+            column
+            for column in ["name", "category", "area", "price_range", "open_hours", "tags", "note"]
+            if column in filtered.columns
+        ]
+        st.dataframe(filtered[display_columns], use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
