@@ -1,83 +1,101 @@
-# 周辺ランチ・飲食店ランダムピッカー
+# 天王洲ランチルーレット - Streamlit + Google Sheets版
 
-`restaurants.csv` に登録した飲食店リストから、カテゴリ条件に合うお店をランダムに選ぶ Streamlit アプリです。
+Google Sheetsを店舗リストとして読み込み、Streamlit Cloudで公開するランチ抽選アプリです。
 
-Google Maps API は使用しません。APIキーも不要です。
+Apps Scriptは使いません。Google Maps APIも使いません。
 
-## ファイル構成
+## 構成
 
 ```text
-restaurant_picker_streamlit_csv/
+tennozu_lunch_streamlit_gsheet/
 ├── streamlit_app.py
-├── restaurants.csv
 ├── requirements.txt
-└── README.md
+├── README.md
+├── sample_restaurants.csv
+└── .streamlit/
+    ├── config.toml
+    └── secrets.toml.example
 ```
 
-## ローカル実行
+## データ元
+
+デフォルトで以下のGoogle Spreadsheetを読み込みます。
+
+```text
+https://docs.google.com/spreadsheets/d/1ZrXZcY-Fr4My0aoj8VCT6VxG_SN6czrvLa7xT8pw1U4/edit?gid=0#gid=0
+```
+
+コード内の `DEFAULT_GOOGLE_SHEET_URL` に埋め込み済みです。
+
+別シートに変える場合は、コードを編集するか、Streamlit CloudのSecretsで上書きできます。
+
+```toml
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/xxxxxxxxxxxxxxxxxxxx/edit?gid=0#gid=0"
+```
+
+## Google Sheetの列
+
+1行目に以下のヘッダーを置いてください。
+
+```csv
+name,category,area,map_url,address,price_range,open_hours,tags,note,active,source_url,last_checked
+```
+
+必須列:
+
+```text
+name
+category
+```
+
+`active` は空欄なら有効です。以下の値なら非表示になります。
+
+```text
+false, 0, no, n, off, inactive, 無効
+```
+
+## ローカル起動
 
 ```bash
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-## Streamlit Community Cloud で公開する手順
+## Streamlit Cloud公開
 
-1. このフォルダの中身を GitHub リポジトリにアップロードする。
-2. Streamlit Community Cloud で New app を作成する。
-3. Repository / Branch / Main file path を指定する。
-4. Main file path には `streamlit_app.py` を指定する。
-5. Deploy する。
+1. このフォルダをGitHubリポジトリにアップロード
+2. Streamlit Community CloudでNew app
+3. Repositoryを選択
+4. Main file pathに以下を指定
 
-Google Maps API を使わないため、Secrets 設定は不要です。
-
-## restaurants.csv の列
-
-必須列は `name` と `category` です。
-
-| 列名 | 必須 | 内容 |
-|---|---:|---|
-| `name` | yes | 店名 |
-| `category` | yes | カテゴリ。例: 和食、洋食、中華、カレー、カフェ |
-| `area` | no | エリア名。例: 天王洲、品川、港南 |
-| `map_url` | no | Google Maps の店舗URL。空欄の場合は店名とエリアでGoogle Maps検索リンクを自動生成 |
-| `address` | no | 住所 |
-| `price_range` | no | 価格帯。例: ¥、¥¥、¥¥¥ |
-| `open_hours` | no | 営業時間メモ |
-| `tags` | no | タグ。カンマ区切り。例: ランチ,一人OK,安い |
-| `note` | no | メモ |
-| `active` | no | `false`, `0`, `off`, `非表示`, `無効` の場合は候補から除外 |
-
-## CSV記入例
-
-```csv
-name,category,area,map_url,address,price_range,open_hours,tags,note,active
-お店A,和食,天王洲,https://maps.app.goo.gl/xxxxx,東京都品川区...,¥¥,11:00-15:00,"ランチ,落ち着く",魚定食が良い,true
-お店B,カレー,天王洲,,東京都品川区...,¥,11:30-14:30,"ランチ,一人OK",混みやすい,true
+```text
+streamlit_app.py
 ```
 
-`map_url` が空欄でも動きます。その場合、アプリ側で Google Maps の検索リンクを作ります。
+5. Deploy
 
-## カテゴリを増やす方法
+Google Sheetは、アプリからCSVエクスポートURLで読むため、少なくとも「リンクを知っている人が閲覧可」にしてください。
 
-`restaurants.csv` の `category` に新しいカテゴリ名を書くだけで、アプリのサイドバーにチェックボックスが自動追加されます。
+## ユーザー設定の保存
 
-例:
+この版は、サードパーティのlocalStorageコンポーネントを使わず、Streamlit公式の `st.query_params` を使います。
 
-```csv
-name,category,area,map_url,address,price_range,open_hours,tags,note,active
-お店C,ラーメン,天王洲,,東京都品川区...,¥,11:00-22:00,"ランチ,早い",替え玉あり,true
+保存されるもの:
+
+```text
+カテゴリON/OFF
+キーワード
+前回と同じ店を避ける
+候補一覧表示
+前回選ばれた店
 ```
 
-## 店を一時的に候補から外す方法
+特徴:
 
-`active` を `false` にすると候補から除外されます。
-
-```csv
-name,category,area,map_url,address,price_range,open_hours,tags,note,active
-お店D,中華,天王洲,,東京都品川区...,¥¥,11:00-15:00,"ランチ",改装中,false
+```text
+同じURLを開くと設定を復元できる
+スマホでも同じURLなら同じ設定で開ける
+ブラウザのlocalStorageやCookieには依存しない
 ```
 
-## 注意
-
-同梱の `restaurants.csv` はサンプルです。実際の店舗リストに置き換えて使ってください。
+厳密な「端末ごとの自動保存」ではありませんが、Streamlit Cloudではこの方が安定します。
