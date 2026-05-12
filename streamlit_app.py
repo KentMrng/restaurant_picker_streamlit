@@ -11,10 +11,8 @@ import streamlit as st
 
 APP_TITLE = "天王洲ランチルーレット"
 
-DEFAULT_GOOGLE_SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/"
-    "1ZrXZcY-Fr4My0aoj8VCT6VxG_SN6czrvLa7xT8pw1U4/edit?gid=0#gid=0"
-)
+DEFAULT_GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1ZrXZcY-Fr4My0aoj8VCT6VxG_SN6czrvLa7xT8pw1U4/edit?gid=0#gid=0"
+
 
 OPTIONAL_COLUMNS = [
     "area",
@@ -224,8 +222,9 @@ def render_sidebar_filters(categories: list[str]) -> list[str]:
         selected_categories = []
         current = set(st.session_state.get("selected_categories", categories))
 
-        for category in categories:
-            key = f"category__{stable_key(category)}"
+        for index, category in enumerate(categories):
+            key = f"category__{index}"
+
             if key not in st.session_state:
                 st.session_state[key] = category in current
 
